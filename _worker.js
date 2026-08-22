@@ -1,5 +1,6 @@
 // 代码基本都抄的CM和AK大佬和天书大佬的项目，在此感谢各位大佬的无私奉献。
 import {connect} from 'cloudflare:sockets';
+import {TlsClient} from './TlsClient.js';
 const defaultUuid = ''; // 可在环境变量配置，变量名称为UUID，两个地方都不写为不验证uuid
 const defaultPassword = ''; // 可在环境变量配置，变量名称为PASSWORD，两个地方都不写为不验证密码
 const socks5AndHttpUser = ''; // 可在环境变量配置，变量名称为S5HTTPUSER，两个地方都不写为不验证密码
@@ -29,53 +30,47 @@ const ssAeadEncryptCount = 16;
 // ---------------------------------------------------------------------------------
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
+const dnsStrategyOrder = ['ipv6', 'ipv4', 'hostname'];//socket获取地址类型连接优先级（可以只指定其中一个）
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
-//五者的socket获取顺序，全局模式下为这五个的顺序，非全局为：直连>socks>http>https>turn>nat64>proxyip>finallyProxyHost
-const proxyStrategyOrder = ['socks', 'http', 'https', 'turn', 'nat64'];
+//出站socket获取顺序，全局模式下按数组顺序，非全局为：直连>socks>http>https>sstp>turn>turns>nat64>proxyip>finallyProxyHost
+const proxyStrategyOrder = ['socks', 'http', 'https', 'sstp', 'turn', 'turns', 'nat64'];
 const sharedEchDns = 'lido.fi+https://223.5.5.5/dns-query'; //ECHDNS配置
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
 const dohNatEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
-const proxyIpAddrs = {EU: 'ProxyIP.DE.CMLiussss.net', AS: 'ProxyIP.SG.CMLiussss.net', JP: 'ProxyIP.JP.CMLiussss.net', US: 'ProxyIP.US.CMLiussss.net'};//分区域proxyip
-const finallyProxyHost = 'ProxyIP.CMLiussss.net';//兜底proxyip
+const finallyProxyHost = 'proxy.zjcloud.us.ci';//兜底proxyip
 // 订阅和面板使用的优选ip地址，可支持ip:port#name格式
 const ipListAll = ["172.64.154.125", "104.18.39.123", "172.64.145.18", "104.18.42.218", "104.18.33.131", "172.64.145.38", "172.64.145.202", "104.18.42.151"];
-const coloRegions = {
-    JP: new Set(['FUK', 'ICN', 'KIX', 'NRT', 'OKA']),
-    EU: new Set([
-        'ACC', 'ADB', 'ALA', 'ALG', 'AMM', 'AMS', 'ARN', 'ATH', 'BAH', 'BCN', 'BEG', 'BGW', 'BOD', 'BRU', 'BTS', 'BUD', 'CAI',
-        'CDG', 'CPH', 'CPT', 'DAR', 'DKR', 'DMM', 'DOH', 'DUB', 'DUR', 'DUS', 'DXB', 'EBB', 'EDI', 'EVN', 'FCO', 'FRA', 'GOT',
-        'GVA', 'HAM', 'HEL', 'HRE', 'IST', 'JED', 'JIB', 'JNB', 'KBP', 'KEF', 'KWI', 'LAD', 'LED', 'LHR', 'LIS', 'LOS', 'LUX',
-        'LYS', 'MAD', 'MAN', 'MCT', 'MPM', 'MRS', 'MUC', 'MXP', 'NBO', 'OSL', 'OTP', 'PMO', 'PRG', 'RIX', 'RUH', 'RUN', 'SKG',
-        'SOF', 'STR', 'TBS', 'TLL', 'TLV', 'TUN', 'VIE', 'VNO', 'WAW', 'ZAG', 'ZRH']),
-    AS: new Set([
-        'ADL', 'AKL', 'AMD', 'BKK', 'BLR', 'BNE', 'BOM', 'CBR', 'CCU', 'CEB', 'CGK', 'CMB', 'COK', 'DAC', 'DEL', 'HAN', 'HKG',
-        'HYD', 'ISB', 'JHB', 'JOG', 'KCH', 'KHH', 'KHI', 'KTM', 'KUL', 'LHE', 'MAA', 'MEL', 'MFM', 'MLE', 'MNL', 'NAG', 'NOU',
-        'PAT', 'PBH', 'PER', 'PNH', 'SGN', 'SIN', 'SYD', 'TPE', 'ULN', 'VTE'])
+let currentColo = null;
+const getCurrentColo = async () => {
+    if (currentColo !== null) return currentColo;
+    try {
+        const text = await fetch('https://cp.cloudflare.com/cdn-cgi/trace', {
+            headers: {'User-Agent': 'Mozilla/5.0'}
+        }).then(r => r.text());
+        const i = text.indexOf('colo=');
+        const colo = i >= 0 ? text.slice(i + 5, i + 8) : '';
+        currentColo = colo ? `${colo.toLowerCase()}.proxy.zjcloud.us.ci` : '';
+        return currentColo;
+    } catch {
+        currentColo = null;
+        return '';
+    }
 };
-const coloToProxyMap = new Map();
-for (const [region, colos] of Object.entries(coloRegions)) {for (const colo of colos) coloToProxyMap.set(colo, proxyIpAddrs[region])}
 const textEncoder = new TextEncoder(), textDecoder = new TextDecoder();
+const panelHtmlUrl = 'https://1345695.github.io/index-404-html/panel';
+const errorHtmlUrl = 'https://1345695.github.io/index-404-html/';
 import wasmModule from './protocol.wasm';
 const instance = new WebAssembly.Instance(wasmModule);
 const {
     memory, getUuidPtr, getResultPtr, getDataPtr, getHttpAuthPtr, getSocks5AuthPtr, setHttpAuthLenWasm, setSocks5AuthLenWasm, parseProtocolWasm, parseUrlWasm,
-    initCredentialsWasm, getPanelHtmlPtr, getPanelHtmlLen, getErrorHtmlPtr, getErrorHtmlLen, getTemplateWasm, getSecretStringWasm
+    initCredentialsWasm, getTemplateWasm, getSecretStringWasm
 } = instance.exports;
 const wasmMem = new Uint8Array(memory.buffer);
 const wasmRes = new Int32Array(memory.buffer, getResultPtr(), 36);
 const dataPtr = getDataPtr();
-let isInitialized = false, rawHtml = null, rawErrorHtml = null, config = null, cachedTemplates = null, strList = null, userAgentSuffix = null;
-const decompressWasm = async (ptrFn, lenFn) => {
-    const ptr = ptrFn(), len = lenFn();
-    const compressedData = wasmMem.subarray(ptr, ptr + len);
-    const ds = new DecompressionStream("gzip");
-    const writer = ds.writable.getWriter();
-    writer.write(compressedData);
-    writer.close();
-    return await new Response(ds.readable).text();
-};
+let isInitialized = false, config = null, cachedTemplates = null, strList = null, userAgentSuffix = null;
 const getEnv = (env) => {
     if (config) return config;
     config = {
@@ -343,31 +338,158 @@ const addrTypeIs = (hostname) => {
     return (char0 - 48) >>> 0 > 9 ? (char0 === 91 ? 4 : 3) : isIPv4(hostname) ? 1 : 3;
 };
 const createConnect = (hostname, port, socketOptions, socket = connect({hostname, port}, socketOptions)) => socket.opened.then(() => socket);
-const concurrentConnect = (hostname, port, limit = concurrency, socketOptions) => {
-    if (limit === 1) return createConnect(hostname, port, socketOptions);
-    let settled = false, winner = null;
-    const sockets = new Array(limit);
-    const closeSocket = socket => {try {socket?.close()} catch {}};
-    const attempts = Array.from({length: limit}, (_, i) => {
-        const socket = connect({hostname, port}, socketOptions);
-        sockets[i] = socket;
-        return createConnect(hostname, port, socketOptions, socket).then(openedSocket => {
-            if (settled && openedSocket !== winner) closeSocket(openedSocket);
-            return openedSocket;
-        });
+const dohJsonOptions = {headers: {'Accept': 'application/dns-json'}}, dohHeaders = {'content-type': 'application/dns-message'};
+const concurrentDnsResolve = async (hostname, recordType) => {
+    const dnsResult = await Promise.any(dohNatEndpoints.map(endpoint =>
+        fetch(`${endpoint}?name=${hostname}&type=${recordType}`, dohJsonOptions).then(response => {
+            if (!response.ok) throw new Error();
+            return response.json();
+        })
+    ));
+    const answer = dnsResult.Answer || dnsResult.answer;
+    if (!answer || answer.length === 0) return null;
+    return answer;
+};
+const dnsConnectCache = new Map();
+const setDnsConnectCache = (hostname, result) => {
+    if (!dnsConnectCache.has(hostname) && dnsConnectCache.size >= 5000) {
+        let oldestKey, oldestExpires = Infinity;
+        for (const [key, value] of dnsConnectCache) if (value.expires < oldestExpires) oldestKey = key, oldestExpires = value.expires;
+        if (oldestKey !== undefined) dnsConnectCache.delete(oldestKey);
+    }
+    dnsConnectCache.set(hostname, result);
+};
+const dnsConnectResolve = async hostname => {
+    const parseAnswer = (answer, type, wrap) => {
+        const records = [], now = Date.now();
+        let ttl = 0;
+        if (answer) {
+            for (let i = 0, len = answer.length; i < len; i++) {
+                const record = answer[i];
+                if (record.type === type && record.data) {
+                    records.push(wrap ? `[${record.data}]` : record.data);
+                    if (record.TTL > 0) ttl = ttl ? Math.min(ttl, record.TTL * 1000) : record.TTL * 1000;
+                }
+            }
+        }
+        return {records, expires: now + Math.max(ttl, 180000)};
+    };
+    const [aaaa, a] = await Promise.all([
+        dnsStrategyOrder.includes('ipv6') ? concurrentDnsResolve(hostname, 'AAAA').catch(() => null) : Promise.resolve(null),
+        dnsStrategyOrder.includes('ipv4') ? concurrentDnsResolve(hostname, 'A').catch(() => null) : Promise.resolve(null)
+    ]);
+    const ipv6 = parseAnswer(aaaa, 28, true), ipv4 = parseAnswer(a, 1, false);
+    const hasRecord = ipv6.records.length || ipv4.records.length;
+    const result = {ipv6: ipv6.records, ipv4: ipv4.records, expires: hasRecord ? Math.max(ipv6.expires, ipv4.expires) : Date.now() + 5000, refreshing: null};
+    setDnsConnectCache(hostname, result);
+    return result;
+};
+const getDnsConnectCache = hostname => {
+    let cached = dnsConnectCache.get(hostname);
+    const now = Date.now();
+    if (!cached) return dnsConnectResolve(hostname);
+    if (cached.expires > now) return cached;
+    cached.refreshing ||= dnsConnectResolve(hostname).catch(() => null).finally(() => {
+        const current = dnsConnectCache.get(hostname);
+        if (current) current.refreshing = null;
     });
-    return Promise.any(attempts).then(socket => {
-        settled = true, winner = socket;
-        for (const other of sockets) if (other !== socket) closeSocket(other);
-        return socket;
+    return cached;
+};
+const getTxtDnsCache = txtdns => {
+    const key = `TXT:${txtdns}`;
+    let cached = dnsConnectCache.get(key);
+    const now = Date.now(), resolve = async () => {
+        const answer = await concurrentDnsResolve(txtdns, 'TXT').catch(() => null);
+        const result = {answer, expires: Date.now() + (answer ? Math.max(ttl, 180000) : 5000), refreshing: null};
+        setDnsConnectCache(key, result);
+        return result;
+    };
+    if (!cached) return resolve();
+    if (cached.expires > now) return cached;
+    cached.refreshing ||= resolve().catch(() => null).finally(() => {
+        const current = dnsConnectCache.get(key);
+        if (current) current.refreshing = null;
+    });
+    return cached.answer ? cached : cached.refreshing;
+};
+const shuffleCandidates = (ipv6 = [], ipv4 = [], hostname) => {
+    const shuffle = records => {
+        records = records.slice();
+        for (let i = records.length - 1; i > 0; i--) {
+            const j = (Math.random() * (i + 1)) | 0;
+            [records[i], records[j]] = [records[j], records[i]];
+        }
+        return records;
+    };
+    return dnsStrategyOrder.map(strategy => {
+        const candidates = strategy === 'ipv6' ? ipv6 : strategy === 'ipv4' ? ipv4 : (strategy === 'hostname' && hostname) ? [hostname] : [];
+        return candidates.length ? shuffle(candidates) : null;
+    }).filter(Boolean);
+};
+const raceAny = (promises, closeFn) => {
+    let settled = false, winner = null;
+    const resolvedList = [];
+    const wrapped = promises.map(async p => {
+        const res = await p;
+        if (!res) throw new Error();
+        if (settled) {
+            closeFn?.(res);
+            throw new Error();
+        }
+        resolvedList.push(res);
+        return res;
+    });
+    return Promise.any(wrapped).then(win => {
+        settled = true, winner = win;
+        for (const item of resolvedList) if (item !== winner) closeFn?.(item);
+        return winner;
     }, err => {
         settled = true;
-        for (const socket of sockets) closeSocket(socket);
+        for (const item of resolvedList) closeFn?.(item);
         throw err;
     });
 };
+const connectCandidates = (candidates, port, limit, socketOptions) => {
+    if (!candidates?.length) return Promise.reject();
+    if (candidates.length === 1 && limit === 1) return createConnect(candidates[0], port, socketOptions);
+    const targets = (candidates.length === 1 && limit > 1)
+        ? Array(limit).fill(candidates[0])
+        : (limit && candidates.length > limit ? candidates.slice(0, limit) : candidates);
+    const closeSocket = s => {try {s?.close?.()} catch {}};
+    const attempts = targets.map(candidate => {
+        const socket = connect({hostname: candidate, port}, socketOptions);
+        return socket.opened.then(() => socket, err => {
+            closeSocket(socket);
+            throw err;
+        });
+    });
+    return raceAny(attempts, closeSocket);
+};
+const connectGroups = async (groups, port, limit, socketOptions) => {
+    let lastError;
+    for (const candidates of groups) try {return await connectCandidates(candidates, port, limit, socketOptions)} catch (err) {lastError = err}
+    throw lastError || new Error('No connect candidates');
+};
+const concurrentConnect = async (hostname, port, limit = concurrency, socketOptions, addrType) => {
+    if (addrType !== 3) return connectCandidates([hostname], port, limit, socketOptions);
+    if (dnsStrategyOrder.length === 1 && dnsStrategyOrder[0] === 'hostname') {
+        return connectCandidates([hostname], port, limit, socketOptions);
+    }
+    const cached = await getDnsConnectCache(hostname);
+    const groups = shuffleCandidates(cached.ipv6, cached.ipv4, hostname);
+    try {
+        return await connectGroups(groups, port, limit, socketOptions);
+    } catch (err) {
+        const refreshed = cached.refreshing ? await cached.refreshing : null;
+        if (refreshed && refreshed !== cached) {
+            const refreshedGroups = shuffleCandidates(refreshed.ipv6, refreshed.ipv4, hostname);
+            return connectGroups(refreshedGroups, port, limit, socketOptions);
+        }
+        throw err;
+    }
+};
 const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, addrBytes, limit) => {
-    const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, limit);
+    const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, limit, undefined, addrTypeIs(socksAuth.hostname));
     const writer = socksSocket.writable.getWriter();
     const reader = socksSocket.readable.getReader();
     await writer.write(new Uint8Array([5, 2, 0, 2]));
@@ -393,605 +515,6 @@ const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, ad
     writer.releaseLock(), reader.releaseLock();
     return socksSocket;
 };
-const {TlsClient} = (() => {
-    const e = 769, t = 771, n = 772, r = 20, i = 21, s = 22, a = 23, h = 1, c = 2, o = 4, l = 8, f = 11, u = 12, y = 13, p = 14, w = 15, d = 16, g = 20, k = 24, v = 0, A = 10, S = 11, m = 13, b = 16, C = 43, H = 45, T = 51, E = 0, L = new TextEncoder, K = new TextDecoder, P = new Uint8Array(0), U = new Map(Object.entries({
-        TLS_AES_128_GCM_SHA256: {id: 4865, keyLen: 16, ivLen: 12, hash: "SHA-256", tls13: !0},
-        TLS_AES_256_GCM_SHA384: {id: 4866, keyLen: 32, ivLen: 12, hash: "SHA-384", tls13: !0},
-        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: {id: 49199, keyLen: 16, ivLen: 4, hash: "SHA-256", kex: "ECDHE"},
-        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: {id: 49200, keyLen: 32, ivLen: 4, hash: "SHA-384", kex: "ECDHE"},
-        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: {id: 49195, keyLen: 16, ivLen: 4, hash: "SHA-256", kex: "ECDHE"},
-        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: {id: 49196, keyLen: 32, ivLen: 4, hash: "SHA-384", kex: "ECDHE"}
-    }).map(([, e]) => [e.id, e])), I = new Map([[29, "X25519"], [23, "P-256"]]), x = [2052, 2053, 2054, 2055, 2056, 2057, 2058, 2059, 1027, 1283, 1539, 1025, 1281, 1537, 513, 515], _ = (...e) => {
-        const t = e => {
-            const n = [];
-            for (const r of e) r instanceof Uint8Array ? n.push(...r) : Array.isArray(r) ? n.push(...t(r)) : "number" == typeof r && n.push(r);
-            return n
-        };
-        return new Uint8Array(t(e))
-    }, B = e => [e >> 8 & 255, 255 & e], R = (e, t) => e[t] << 8 | e[t + 1], M = (e, t) => e[t] << 16 | e[t + 1] << 8 | e[t + 2], W = (...e) => {
-        const t = e.filter(e => e && e.length > 0), n = t.reduce((e, t) => e + t.length, 0), r = new Uint8Array(n);
-        let i = 0;
-        for (const e of t) r.set(e, i), i += e.length;
-        return r
-    }, D = e => crypto.getRandomValues(new Uint8Array(e)), N = (e, t) => {
-        if (!e || !t || e.length !== t.length) return !1;
-        let n = 0;
-        for (let r = 0; r < e.length; r++) n |= e[r] ^ t[r];
-        return 0 === n
-    }, q = e => "SHA-512" === e ? 64 : "SHA-384" === e ? 48 : 32;
-    async function $(e, t, n) {
-        const r = await crypto.subtle.importKey("raw", t, {name: "HMAC", hash: e}, !1, ["sign"]);
-        return new Uint8Array(await crypto.subtle.sign("HMAC", r, n))
-    }
-    async function G(e, t) {return new Uint8Array(await crypto.subtle.digest(e, t))}
-    async function V(e, t, n, r, i = "SHA-256") {
-        const s = W(L.encode(t), n);
-        let a = new Uint8Array(0), h = s;
-        for (; a.length < r;) {
-            h = await $(i, e, h);
-            const t = await $(i, e, W(h, s));
-            a = W(a, t)
-        }
-        return a.slice(0, r)
-    }
-    async function X(e, t, n) {return t && t.length || (t = new Uint8Array(q(e))), $(e, t, n)}
-    async function O(e, t, n, r, i) {
-        const s = L.encode("tls13 " + n);
-        return async function (e, t, n, r) {
-            const i = q(e), s = Math.ceil(r / i);
-            let a = new Uint8Array(0), h = new Uint8Array(0);
-            for (let r = 1; r <= s; r++) h = await $(e, t, W(h, n, [r])), a = W(a, h);
-            return a.slice(0, r)
-        }(e, t, _(B(i), s.length, s, r.length, r), i)
-    }
-    async function F(e = "P-256") {
-        if ("X25519" === e) {
-            const e = await crypto.subtle.generateKey({name: "X25519"}, !0, ["deriveBits"]);
-            return {kp: e, pk: new Uint8Array(await crypto.subtle.exportKey("raw", e.publicKey))}
-        }
-        const t = await crypto.subtle.generateKey({name: "ECDH", namedCurve: e}, !0, ["deriveBits"]);
-        return {kp: t, pk: new Uint8Array(await crypto.subtle.exportKey("raw", t.publicKey))}
-    }
-    async function Y(e, t, n = "P-256") {
-        if ("X25519" === n) {
-            const n = await crypto.subtle.importKey("raw", t, {name: "X25519"}, !1, []);
-            return new Uint8Array(await crypto.subtle.deriveBits({name: "X25519", public: n}, e, 256))
-        }
-        const r = await crypto.subtle.importKey("raw", t, {name: "ECDH", namedCurve: n}, !1, []), i = "P-384" === n ? 384 : "P-521" === n ? 528 : 256;
-        return new Uint8Array(await crypto.subtle.deriveBits({name: "ECDH", public: r}, e, i))
-    }
-    async function J(e, t) {return crypto.subtle.importKey("raw", e, {name: "AES-GCM"}, !1, [t])}
-    async function j(e, t, n, r) {return new Uint8Array(await crypto.subtle.encrypt({name: "AES-GCM", iv: t, additionalData: r, tagLength: 128}, e, n))}
-    async function z(e, t, n, r) {return new Uint8Array(await crypto.subtle.decrypt({name: "AES-GCM", iv: t, additionalData: r, tagLength: 128}, e, n))}
-    function ie(e, n, r = t) {return _(e, B(r), B(n.length), n)}
-    function se(e, t) {return _(e, (e => [e >> 16 & 255, e >> 8 & 255, 255 & e])(t.length), t)}
-    class ae {
-        constructor() {this.b = new Uint8Array(0)}
-        feed(e) {this.b = W(this.b, e)}
-        next() {
-            if (this.b.length < 5) return null;
-            const e = this.b[0], t = R(this.b, 1), n = R(this.b, 3);
-            if (n > 18432) throw 0;
-            if (this.b.length < 5 + n) return null;
-            const r = this.b.slice(5, 5 + n);
-            return this.b = this.b.slice(5 + n), {type: e, version: t, length: n, fragment: r}
-        }
-    }
-    class he {
-        constructor() {this.b = new Uint8Array(0)}
-        feed(e) {this.b = W(this.b, e)}
-        next() {
-            if (this.b.length < 4) return null;
-            const e = this.b[0], t = M(this.b, 1);
-            if (this.b.length < 4 + t) return null;
-            const n = this.b.slice(4, 4 + t), r = this.b.slice(0, 4 + t);
-            return this.b = this.b.slice(4 + t), {type: e, length: t, body: n, raw: r}
-        }
-    }
-    function ce(e) {
-        let t = 0;
-        const r = R(e, t);
-        t += 2;
-        const i = e.slice(t, t + 32);
-        t += 32;
-        const s = e[t++], a = e.slice(t, t + s);
-        t += s;
-        const h = R(e, t);
-        t += 2;
-        const c = e[t++];
-        let o = r, l = null, cookie = null;
-        if (t < e.length) {
-            const n = R(e, t);
-            t += 2;
-            const r = t + n;
-            for (; t + 4 <= r;) {
-                const n = R(e, t);
-                t += 2;
-                const r = R(e, t);
-                t += 2;
-                const i = e.slice(t, t + r);
-                if (t += r, n === C && r >= 2) {o = R(i, 0)} else if (n === T && r >= 2) {
-                    const e = R(i, 0), t = r >= 4 ? R(i, 2) : 0;
-                    l = {group: e, key: t ? i.slice(4, 4 + t) : P}
-                } else if (44 === n && r >= 2) {cookie = i}
-            }
-        }
-        const u = new Uint8Array([207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140, 2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226, 200, 168, 51, 156]);
-        return {version: r, sr: i, sid: a, cs: h, comp: c, sv: o, ks: l, cookie, isHRR: N(i, u), isTls13: o === n}
-    }
-    function oe(e) {
-        let t = 0;
-        t++;
-        const n = R(e, t);
-        t += 2;
-        const r = e[t++];
-        return {nc: n, spk: e.slice(t, t + r)}
-    }
-    const F0 = e => {
-        if (e = String(e ?? "").trim(), "[" === e[0] && "]" === e[e.length - 1] && (e = e.slice(1, -1)), !e || e.includes(":")) return "";
-        const t = e.split(".");
-        if (4 !== t.length) return e;
-        for (const n of t) {
-            if ("" === n || n.length > 3) return e;
-            let t = 0;
-            for (let r = 0; r < n.length; r++) {
-                const i = n.charCodeAt(r) - 48;
-                if (i < 0 || i > 9) return e;
-                t = 10 * t + i
-            }
-            if (t > 255) return e
-        }
-        return ""
-    }, Z0 = e => e && 1 === e[0] && 112 === e[1];
-    function ue(e, n, r, {cookie: ck = null, sessionId: id = P, groups: gs = null} = {}) {
-        n = F0(n);
-        const c = [4865, 4866, 49199, 49200, 49195, 49196];
-        const o = _(...c.flatMap(B)), l = [_(255, 1, 0, 1, 0)];
-        if (n) {
-            const e = L.encode(n), t = _(0, B(e.length), e);
-            l.push(_(B(v), B(t.length + 2), B(t.length), t))
-        }
-        l.push(_(B(S), 0, 2, 1, 0));
-        const g = gs?.filter(e => I.has(e)) || [];
-        if (!g.length) r?.x25519 && g.push(29), r?.p256 && g.push(23), r instanceof Uint8Array && g.push(23);
-        if (!g.length) throw 0;
-        const gb = _(...g.flatMap(B));
-        l.push(_(B(A), B(gb.length + 2), B(gb.length), gb));
-        const f = _(...x.flatMap(B));
-        l.push(_(B(m), B(f.length + 2), B(f.length), f));
-        ck?.length && l.push(_(B(44), B(ck.length), ck));
-        if (r) {
-            let e;
-            if (l.push(_(B(C), 0, 5, 4, 3, 4, 3, 3)), l.push(_(B(H), 0, 2, 1, 1)), r?.x25519 && r?.p256) {e = W(_(0, 29, B(r.x25519.length), r.x25519), _(0, 23, B(r.p256.length), r.p256))} else if (r?.x25519) {e = _(0, 29, B(r.x25519.length), r.x25519)} else if (r?.p256) {e = _(0, 23, B(r.p256.length), r.p256)} else {
-                if (!(r instanceof Uint8Array)) throw 0;
-                e = _(0, 23, B(r.length), r)
-            }
-            l.push(_(B(T), B(e.length + 2), B(e.length), e))
-        }
-        const y = W(...l);
-        return se(h, _(B(t), e, id.length, id, B(o.length), o, 1, 0, B(y.length), y))
-    }
-    const ye = e => {
-        const t = new Uint8Array(8);
-        return new DataView(t.buffer).setBigUint64(0, e, !1), t
-    }, pe = (e, t) => {
-        const n = e.slice(), r = ye(t);
-        for (let e = 0; e < 8; e++) n[n.length - 8 + e] ^= r[e];
-        return n
-    }, we = async (e, t, n, r, i) => {
-        const [s, a] = await Promise.all([O(e, t, "key", P, n), O(e, t, "iv", P, r)]);
-        return [await J(s, i), a]
-    }, de = e => {
-        let t = e.length - 1;
-        for (; t >= 0 && 0 === e[t];) t--;
-        if (t < 0) throw 0;
-        return {data: e.subarray(0, t), type: e[t]}
-    }, ge = 0xffffffffffffffffn;
-    class TlsClient {
-        constructor(e, t = {}) {this.sk = e, this.sn = t.serverName || "", this.cr = D(32), this.id = D(32), this.sr = null, this.ht = [], this.hc = !1, this.cs = null, this.cc = null, this.i3 = !1, this.ms = null, this.hs = null, this.ck = null, this.wk = null, this.cv = null, this.wv = null, this.ch = null, this.sh = null, this.ci = null, this.si = null, this.ak = null, this.bk = null, this.ai = null, this.bi = null, this.at = null, this.bt = null, this.cn = 0n, this.qn = 0n, this.rp = new ae, this.hp = new he, this.kp = new Map, this.ep = null, this.pq = [], this.rr = [], this.cl = !1, this.cg = !1, this.fl = !1, this.wq = Promise.resolve(), this.cp = null, this.rb = new Uint8Array(65536)}
-        rh(e) {this.ht.push(e)}
-        ts() {return 1 === this.ht.length ? this.ht[0] : W(...this.ht)}
-        gfc(e) {return U.get(e) || null}
-        fc() {
-            if (this.cn > ge) throw 0;
-            return this.cn++
-        }
-        fs() {
-            if (this.qn > ge) throw 0;
-            return this.qn++
-        }
-        fail() {
-            this.fl = !0, this.cl = !0;
-            try {this.sk.close()} catch {}
-        }
-        async rc(e, b) {
-            let t;
-            const n = b ? e.read(b) : e.read(), r = await Promise.race([n, new Promise(e => t = setTimeout(e, 3e4, 0))]).finally(() => clearTimeout(t));
-            if (r) return r;
-            try {await e.cancel("err")} catch {}
-            try {await n} catch {}
-            throw 0
-        }
-        async pr(e, t, n) {
-            for (; ;) {
-                let r;
-                for (; r = this.rp.next();) if (await t(r)) return;
-                const {value: i, done: s} = await this.rc(e);
-                if (s) throw 0;
-                this.rp.feed(i)
-            }
-        }
-        async ph(e, t, n) {
-            for (let e; e = this.hp.next();) if (await t(e)) return;
-            return this.pr(e, async e => {
-                if (e.type === i) {
-                    if (Z0(e.fragment)) return;
-                    throw 0
-                }
-                if (e.type === s) {
-                    this.hp.feed(e.fragment);
-                    for (let e; e = this.hp.next();) if (await t(e)) return 1
-                }
-            }, n)
-        }
-        chs() {this.cr = this.id = this.sr = this.ht = this.ms = this.hs = this.ch = this.sh = this.ci = this.si = this.ep = null, this.kp?.clear(), this.kp = null}
-        async handshake() {
-            const [t, n] = await Promise.allSettled([F("P-256"), F("X25519")]);
-            this.kp = new Map, "fulfilled" === t.status && this.kp.set(23, t.value), "fulfilled" === n.status && this.kp.set(29, n.value);
-            if (!this.kp.size) throw 0;
-            this.ep = (this.kp.get(23) || this.kp.get(29)).kp;
-            const r = this.sk.readable.getReader(), a = this.sk.writable.getWriter();
-            try {
-                const x = {x25519: this.kp.get(29)?.pk, p256: this.kp.get(23)?.pk};
-                const sg = [29, 23].filter(e => this.kp.has(e));
-                const h = ue(this.cr, this.sn, x, {sessionId: this.id, groups: sg});
-                this.rh(h), await a.write(ie(s, h, e));
-                let o = await this.rsh(r);
-                if (o.isHRR) {
-                    const gp = o.ks?.group;
-                    if (!I.has(gp)) throw 0;
-                    const kp = await F(I.get(gp));
-                    this.kp.set(gp, kp), this.ep = kp.kp;
-                    const dg = await G(this.cc.hash, h);
-                    this.ht = [se(254, dg), this.ht[this.ht.length - 1]];
-                    const rs = 29 === gp ? {x25519: kp.pk} : {p256: kp.pk};
-                    const ry = ue(this.cr, this.sn, rs, {cookie: o.cookie, sessionId: this.id, groups: sg});
-                    this.rh(ry), await a.write(ie(s, ry, e)), o = await this.rsh(r);
-                    if (o.isHRR) throw 0
-                }
-                if (o.ks?.group && this.kp.has(o.ks.group)) {
-                    const e = this.kp.get(o.ks.group);
-                    this.ep = e.kp
-                }
-                o.isTls13 ? await this.h13(r, a, o) : await this.h12(r, a), this.hc = !0, this.chs()
-            } finally {r.releaseLock(), a.releaseLock()}
-        }
-        async rsh(e) {
-            for (; ;) {
-                const {value: t, done: n} = await this.rc(e);
-                if (n) throw 0;
-                let r;
-                for (this.rp.feed(t); r = this.rp.next();) {
-                    if (r.type === i) {
-                        if (Z0(r.fragment)) continue;
-                        throw 0
-                    }
-                    if (r.type !== s) continue;
-                    let e;
-                    for (this.hp.feed(r.fragment); e = this.hp.next();) {
-                        if (e.type !== c) continue;
-                        this.rh(e.raw);
-                        const t = ce(e.body), n = this.gfc(t.cs);
-                        if (!n || t.comp || t.isTls13 !== !!n.tls13 || !t.isTls13 && t.sv !== 771) throw 0;
-                        return this.sr = t.sr, this.cs = t.cs, this.cc = n, this.i3 = t.isTls13, t
-                    }
-                }
-            }
-        }
-        async h12(e, t) {
-            let n = null, a = !1, rq = !1;
-            if (await this.ph(e, async e => {
-                switch (e.type) {
-                    case f: {
-                        this.rh(e.raw);
-                        break
-                    }
-                    case u:
-                        this.rh(e.raw), n = oe(e.body);
-                        break;
-                    case p:
-                        return this.rh(e.raw), a = !0, 1;
-                    case y:
-                        this.rh(e.raw), rq = !0;
-                        break;
-                    default:
-                        this.rh(e.raw)
-                }
-            }, "err"), !a) {throw 0}
-            if (!n) throw 0;
-            const h = I.get(n.nc);
-            if (!h) throw 0;
-            const c = this.kp.get(n.nc);
-            if (!c) throw 0;
-            if (rq) {
-                const ec = se(f, _(0, 0, 0));
-                this.rh(ec), await t.write(ie(s, ec))
-            }
-            const o = await Y(c.kp.privateKey, n.spk, h), l = se(d, _(c.pk.length, c.pk));
-            this.rh(l);
-            const w = this.cc.hash;
-            this.ms = await V(o, "master secret", W(this.cr, this.sr), 48, w);
-            const k = this.cc.keyLen, v = this.cc.ivLen, A = await V(this.ms, "key expansion", W(this.sr, this.cr), 2 * k + 2 * v, w);
-            [this.ck, this.wk] = await Promise.all([J(A.slice(0, k), "encrypt"), J(A.slice(k, 2 * k), "decrypt")]), this.cv = A.slice(2 * k, 2 * k + v), this.wv = A.slice(2 * k + v, 2 * k + 2 * v), await t.write(ie(s, l)), await t.write(ie(r, _(1)));
-            const S = await V(this.ms, "client finished", await G(w, this.ts()), 12, w), m = se(g, S);
-            this.rh(m), await t.write(ie(s, await this.e12(m, s)));
-            let b = !1;
-            await this.pr(e, async e => {
-                if (e.type === i) {
-                    if (Z0(e.fragment)) return;
-                    throw 0
-                }
-                if (e.type === r) return void (b = !0);
-                if (e.type !== s || !b) return;
-                const t = await this.d12(e.fragment, s);
-                if (t[0] !== g) return;
-                const n = M(t, 1), a = t.slice(4, 4 + n), h = await V(this.ms, "server finished", await G(w, this.ts()), 12, w);
-                if (!N(a, h)) throw 0;
-                return 1
-            }, "err")
-        }
-        async h13(e, t, n) {
-            const h = I.get(n.ks?.group);
-            if (!h || !n.ks?.key?.length) throw 0;
-            const c = this.cc.hash, o = q(c), u = this.cc.keyLen, p = this.cc.ivLen, d = await Y(this.ep.privateKey, n.ks.key, h), k = await X(c, null, new Uint8Array(o)), v = await O(c, k, "derived", await G(c, P), o);
-            this.hs = await X(c, v, d);
-            const A = await G(c, this.ts()), S = await O(c, this.hs, "c hs traffic", A, o), m = await O(c, this.hs, "s hs traffic", A, o);
-            [this.ch, this.ci] = await we(c, S, u, p, "encrypt"), [this.sh, this.si] = await we(c, m, u, p, "decrypt");
-            const b = await O(c, m, "finished", P, o);
-            let C = !1, rq = !1;
-            const H = async e => {
-                switch (e.type) {
-                    case l: {
-                        this.rh(e.raw);
-                        break
-                    }
-                    case f: {
-                        this.rh(e.raw);
-                        break
-                    }
-                    case y:
-                        this.rh(e.raw), rq = !0;
-                        break;
-                    case w:
-                        this.rh(e.raw);
-                        break;
-                    case g: {
-                        const t = await $(c, b, await G(c, this.ts()));
-                        if (!N(t, e.body)) throw 0;
-                        this.rh(e.raw), C = !0;
-                        break
-                    }
-                    default:
-                        this.rh(e.raw)
-                }
-            };
-            await this.pr(e, async e => {
-                if (e.type === r || e.type === s) return;
-                if (e.type === i) {
-                    if (Z0(e.fragment)) return;
-                    throw 0
-                }
-                if (e.type !== a) return;
-                const {data: t, type: n} = await this.d13h(e.fragment), h = t;
-                if (n === s) {
-                    this.hp.feed(h);
-                    for (let e; e = this.hp.next();) if (await H(e), C) return 1
-                }
-            }, "err");
-            const T = await G(c, this.ts()), E = await O(c, this.hs, "derived", await G(c, P), o), L = await X(c, E, new Uint8Array(o)), K = await O(c, L, "c ap traffic", T, o), U = await O(c, L, "s ap traffic", T, o);
-            this.at = K, this.bt = U, [this.ak, this.ai] = await we(c, K, u, p, "encrypt"), [this.bk, this.bi] = await we(c, U, u, p, "decrypt");
-            let ct = P;
-            if (rq) ct = se(f, _(0, 0, 0, 0)), this.rh(ct);
-            const x = await O(c, S, "finished", P, o), _ = await $(c, x, await G(c, this.ts())), B = se(g, _);
-            this.rh(B), await t.write(ie(a, await this.e13h(W(ct, B, [s])))), this.cn = 0n, this.qn = 0n
-        }
-        async e12(e, n, r = this.fc()) {
-            const i = ye(r), s = W(i, [n], B(t), B(e.length));
-            const a = i;
-            return W(a, await j(this.ck, W(this.cv, a), e, s))
-        }
-        async d12(e, n, r = this.fs()) {
-            const i = ye(r);
-            const s = e.slice(0, 8), a = e.slice(8);
-            return z(this.wk, W(this.wv, s), a, W(i, [n], B(t), B(a.length - 16)))
-        }
-        async e13h(e) {
-            const t = pe(this.ci, this.fc()), n = _(a, 3, 3, B(e.length + 16));
-            return j(this.ch, t, e, n)
-        }
-        async d13h(e) {
-            const t = pe(this.si, this.fs()), n = _(a, 3, 3, B(e.length)), r = await z(this.sh, t, e, n);
-            return de(r)
-        }
-        async e13(e, n = this.fc(), r = a) {
-            const t = W(e, [r]), i = pe(this.ai, n), s = _(a, 3, 3, B(t.length + 16));
-            return j(this.ak, i, t, s)
-        }
-        async d13(e, n = this.fs(), r = this.bk, i = this.bi) {
-            const s = pe(i, n), h = _(a, 3, 3, B(e.length)), c = await z(r, s, e, h);
-            return de(c)
-        }
-        write(e) {
-            if (!this.hc || this.fl || this.cg) return Promise.reject(0);
-            const t = this.wq.then(() => this._write(e)), n = t.catch(e => {
-                this.fail();
-                throw e
-            });
-            return this.wq = n.catch(() => {}), n
-        }
-        async _write(e) {
-            if (this.fl || this.cg) throw 0;
-            const t = this.sk.writable.getWriter();
-            try {
-                if (e.length <= 16384) {
-                    await t.write(ie(a, this.i3 ? await this.e13(e) : await this.e12(e, a)));
-                } else {
-                    for (let n = 0; n < e.length;) {
-                        const r = [];
-                        for (let i = 0; i < 8 && n < e.length; i++, n += 16384) {
-                            const i = e.subarray(n, Math.min(n + 16384, e.length)), s = this.fc();
-                            r.push(this.i3 ? this.e13(i, s).then(e => ie(a, e)) : this.e12(i, a, s).then(e => ie(a, e)))
-                        }
-                        await t.write(W(...await Promise.all(r)))
-                    }
-                }
-            } finally {t.releaseLock();}
-        }
-        read() {
-            if (this.fl) return Promise.reject(0);
-            return this._read().catch(e => {
-                this.fail();
-                throw e
-            })
-        }
-        async _read() {
-            for (; ;) {
-                if (this.pq.length) return this.pq.shift();
-                if (this.cl) return null;
-                const e = [];
-                let n;
-                for (; e.length < 8 && (n = this.rr.length ? this.rr.shift() : this.rp.next());) {
-                    if (this.i3) {
-                        if (n.type === r) continue;
-                        if (n.type !== a) throw 0
-                    } else if (n.type !== a && n.type !== i && n.type !== s) throw 0;
-                    e.push(n)
-                }
-                if (e.length) {
-                    if (!this.i3) {
-                        const t = this.qn;
-                        if (t + BigInt(e.length - 1) > ge) throw 0;
-                        const n = await Promise.all(e.map((e, n) => this.d12(e.fragment, e.type, t + BigInt(n))));
-                        this.qn = t + BigInt(e.length);
-                        for (let t = 0; t < n.length; t++) this.pt(n[t], e[t].type)
-                    } else {
-                        const t = this.qn, n = this.bk, r = this.bi;
-                        if (t + BigInt(e.length - 1) > ge) throw 0;
-                        let i;
-                        try {
-                            i = await Promise.all(e.map((e, i) => this.d13(e.fragment, t + BigInt(i), n, r)));
-                        } catch {
-                            i = null
-                        }
-                        if (i) {
-                            for (let n = 0; n < i.length; n++) {
-                                this.qn = t + BigInt(n + 1);
-                                const r = await this.p13(i[n]);
-                                if (null !== r) {
-                                    n + 1 < e.length && this.rr.unshift(...e.slice(n + 1));
-                                    const t = 1 === r ? this.qku() : null;
-                                    await this.usr();
-                                    t && await t;
-                                    break
-                                }
-                            }
-                        } else {
-                            for (let n = 0; n < e.length; n++) {
-                                const r = await this.d13(e[n].fragment, this.qn);
-                                this.qn++;
-                                const i = await this.p13(r);
-                                if (null !== i) {
-                                    n + 1 < e.length && this.rr.unshift(...e.slice(n + 1));
-                                    const t = 1 === i ? this.qku() : null;
-                                    await this.usr();
-                                    t && await t;
-                                    break
-                                }
-                            }
-                        }
-                    }
-                    if (this.pq.length) return this.pq.shift();
-                    if (this.cl) return null;
-                    continue
-                }
-                if (this.cl) return null;
-                const t = this.sk.readable.getReader({mode: "byob"});
-                try {
-                    const {value: e, done: n} = await this.rc(t, this.rb);
-                    if (n) return null;
-                    this.rp.feed(e);
-                    this.rb = new Uint8Array(e.buffer);
-                } finally {t.releaseLock()}
-            }
-        }
-        pt(e, t) {
-            if (t === a) {
-                this.pq.push(e);
-            } else if (t === i) {
-                this.pa(e);
-            } else if (t === s) {
-                let t;
-                for (this.hp.feed(e); t = this.hp.next();) {}
-            }
-        }
-        pa(e) {this.cl = !0, this.close()}
-        async p13({data: e, type: t}) {
-            if (t === a) return this.pq.push(e), null;
-            if (t === i) return this.pa(e), null;
-            if (t !== s) return null;
-            let n, r = null;
-            for (this.hp.feed(e); n = this.hp.next();) {
-                if (n.type === o) continue;
-                if (n.type === k) {
-                    if (1 !== n.body.length || n.body[0] > 1 || null !== r) continue;
-                    r = n.body[0]
-                }
-            }
-            return r
-        }
-        async usr() {
-            const e = this.cc.hash, t = q(e);
-            this.bt = await O(e, this.bt, "traffic upd", P, t), [this.bk, this.bi] = await we(e, this.bt, this.cc.keyLen, this.cc.ivLen, "decrypt"), this.qn = 0n
-        }
-        qku() {
-            const e = this.wq.then(() => this.sku()), t = e.catch(e => {
-                this.fail();
-                throw e
-            });
-            return this.wq = t.catch(() => {}), t
-        }
-        async sku() {
-            if (this.fl || this.cg) throw 0;
-            const e = this.sk.writable.getWriter();
-            try {
-                const t = se(k, _(0));
-                await e.write(ie(a, await this.e13(t, this.fc(), s)))
-            } finally {e.releaseLock()}
-            const t = this.cc.hash, n = q(t);
-            this.at = await O(t, this.at, "traffic upd", P, n), [this.ak, this.ai] = await we(t, this.at, this.cc.keyLen, this.cc.ivLen, "encrypt"), this.cn = 0n
-        }
-        close() {
-            if (this.cp) return this.cp;
-            if (this.fl || !this.hc) {
-                try {this.sk.close()} catch {}
-                return this.cp = Promise.resolve()
-            }
-            this.cg = !0;
-            const e = this.wq.then(async () => {
-                const e = this.sk.writable.getWriter();
-                try {
-                    const t = _(1, E), n = this.i3 ? await this.e13(t, this.fc(), i) : await this.e12(t, i);
-                    await e.write(ie(this.i3 ? a : i, n))
-                } finally {e.releaseLock()}
-            });
-            return this.cp = e.catch(() => {}).finally(() => {
-                this.cl = !0;
-                try {this.sk.close()} catch {}
-            }), this.wq = this.cp, this.cp
-        }
-    }
-    return {TlsClient};
-})();
 const tlsStreamAdapter = (tls, initial = new Uint8Array(0)) => {
     let leftOver = initial, reading = null, closed = false;
     const readNext = async () => {
@@ -1052,17 +575,17 @@ const encodedStaticHeaders = textEncoder.encode(staticHeaders);
 const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addrBytes, limit, useTls = false) => {
     const {username, password, hostname, port} = httpAuth;
     let proxySocket, tlsClient = null, isCustomTls = false;
-    const proxyIsIp = addrTypeIs(hostname) !== 3;
+    const proxyAddrType = addrTypeIs(hostname), proxyIsIp = proxyAddrType !== 3;
     if (useTls && proxyIsIp) {
         isCustomTls = true;
-        proxySocket = await concurrentConnect(hostname, port, limit, {allowHalfOpen: false});
+        proxySocket = await concurrentConnect(hostname, port, limit, {allowHalfOpen: false}, proxyAddrType);
     } else {
         try {
-            proxySocket = await concurrentConnect(hostname, port, limit, useTls ? {secureTransport: 'on', allowHalfOpen: false} : undefined);
+            proxySocket = await concurrentConnect(hostname, port, limit, useTls ? {secureTransport: 'on', allowHalfOpen: false} : undefined, proxyAddrType);
         } catch {
             if (!useTls) return null;
             isCustomTls = true;
-            proxySocket = await concurrentConnect(hostname, port, limit, {allowHalfOpen: false});
+            proxySocket = await concurrentConnect(hostname, port, limit, {allowHalfOpen: false}, proxyAddrType);
         }
     }
     if (isCustomTls) {
@@ -1558,7 +1081,7 @@ const readStun = async (rd, buf) => {
     let total = buf ? buf.length : 0;
     const pull = async () => {
         const {done, value} = await rd.read();
-        if (done) throw 0;
+        if (done) throw new Error();
         chunks.push(value);
         total += value.length;
     };
@@ -1618,7 +1141,7 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
                 try {
                     sock = await openConn(useTls ? {secureTransport: 'on', allowHalfOpen: false} : undefined);
                 } catch {
-                    if (!useTls) throw 0;
+                    if (!useTls) throw new Error();
                     isCustom = true;
                     sock = await openConn({allowHalfOpen: false});
                 }
@@ -1650,7 +1173,7 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         let extra = buffered;
         for (; ;) {
             const result = await readStun(rd, extra);
-            if (!result) throw 0;
+            if (!result) throw new Error();
             const [msg, next] = result;
             extra = next;
             if (sameTid(msg.tid, expectedTid)) return [msg, extra];
@@ -1692,9 +1215,9 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         let tid = newTid();
         await cw.write(stunMsg(0x003, tid, [stunAttr(0x019, new Uint8Array([6, 0, 0, 0]))]));
         let r = await readControl(tid);
-        if (!r) throw 0;
+        if (!r) throw new Error();
         const targetAddress = await targetIp;
-        if (!targetAddress) throw 0;
+        if (!targetAddress) throw new Error();
         const peer = stunAttr(0x012, xorPeer(targetAddress, targetPort));
         let permissionTid = null, connectTid = null, pm = null, cm = null;
         if (r.type === 0x113 && username && parseErr(r.attrs[0x009]) === 401) {
@@ -1719,12 +1242,12 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
                 sign(stunMsg(0x00A, connectTid, [peer, ...aa]))
             ]);
             await cw.write(cat(pm, cm));
-        } else {throw 0}
-        if (r?.type !== 0x103) throw 0;
+        } else {throw new Error()}
+        if (r?.type !== 0x103) throw new Error();
         r = await readControl(permissionTid);
-        if (r?.type !== 0x108) throw 0;
+        if (r?.type !== 0x108) throw new Error();
         r = await readControl(connectTid);
-        if (r?.type !== 0x10A || !r.attrs[0x02A]) throw 0;
+        if (r?.type !== 0x10A || !r.attrs[0x02A]) throw new Error();
         const dRes = await dataPromise;
         const dIsCustom = dRes.isCustom;
         const dw = dIsCustom ? {write: c => dataTls.write(c), releaseLock: () => {}} : data.writable.getWriter();
@@ -1739,7 +1262,7 @@ const connectViaTurnProxy = async ({hostname, port, username, password}, {addrTy
         await dw.write(await sign(stunMsg(0x00B, tid, [stunAttr(0x02A, r.attrs[0x02A]), ...aa])));
         let extra;
         [r, extra] = await readMatching(dr, tid);
-        if (r?.type !== 0x10B) throw 0;
+        if (r?.type !== 0x10B) throw new Error();
         if (!dIsCustom) dr.releaseLock(), dw.releaseLock();
         const tlsStream = dIsCustom ? tlsStreamAdapter(dataTls) : null;
         const readable = tlsStream ? tlsStream.readable : data.readable;
@@ -1759,18 +1282,6 @@ const ipv4ToNat64Ipv6 = (ipv4Address, nat64Prefixes) => {
         if (i === 1) hexStr += ":";
     }
     return `[${nat64Prefixes}${hexStr}]`;
-};
-const dohJsonOptions = {headers: {'Accept': 'application/dns-json'}}, dohHeaders = {'content-type': 'application/dns-message'};
-const concurrentDnsResolve = async (hostname, recordType) => {
-    const dnsResult = await Promise.any(dohNatEndpoints.map(endpoint =>
-        fetch(`${endpoint}?name=${hostname}&type=${recordType}`, dohJsonOptions).then(response => {
-            if (!response.ok) throw new Error();
-            return response.json();
-        })
-    ));
-    const answer = dnsResult.Answer || dnsResult.answer;
-    if (!answer || answer.length === 0) return null;
-    return answer;
 };
 const dohDnsHandler = async (payload) => {
     if (payload.byteLength < 2) return null;
@@ -1831,19 +1342,19 @@ const createDnsWriter = (state, writable, close, closeAfterResponse) => {
 };
 const connectNat64 = async (addrType, port, nat64Auth, addrBytes, proxyAll, limit, isHttp) => {
     const nat64Prefixes = nat64Auth.charCodeAt(0) === 91 ? nat64Auth.slice(1, -1) : nat64Auth;
-    if (!proxyAll) return concurrentConnect(`[${nat64Prefixes}6815:3598]`, port, limit);
+    if (!proxyAll) return concurrentConnect(`[${nat64Prefixes}6815:3598]`, port, limit, undefined, 4);
     const hostname = binaryAddrToString(addrType, addrBytes);
     if (isHttp) addrType = addrTypeIs(hostname);
     if (addrType === 3) {
         const answer = await concurrentDnsResolve(hostname, 'A');
         const aRecord = answer?.find(record => record.type === 1);
-        return aRecord ? concurrentConnect(ipv4ToNat64Ipv6(aRecord.data, nat64Prefixes), port, limit) : null;
+        return aRecord ? concurrentConnect(ipv4ToNat64Ipv6(aRecord.data, nat64Prefixes), port, limit, undefined, 4) : null;
     }
-    if (addrType === 1) return concurrentConnect(ipv4ToNat64Ipv6(hostname, nat64Prefixes), port, limit);
-    return concurrentConnect(hostname, port, limit);
+    if (addrType === 1) return concurrentConnect(ipv4ToNat64Ipv6(hostname, nat64Prefixes), port, limit, undefined, 4);
+    return concurrentConnect(hostname, port, limit, undefined, addrType);
 };
 const txtdnsResult = async (txtdns) => {
-    const answer = await concurrentDnsResolve(txtdns, 'TXT');
+    const answer = (await getTxtDnsCache(txtdns))?.answer;
     if (!answer) return null;
     let txtData, i = 0, len = answer.length;
     for (; i < len; i++) if (answer[i].type === 16) {
@@ -1861,6 +1372,7 @@ const txtdnsResult = async (txtdns) => {
 };
 const proxyIpRegex = /william|fxpip|hhtxt/;
 const connectProxyIp = async (param, limit, txt) => {
+    if (param === undefined) param = await getCurrentColo() || finallyProxyHost;
     if (txt || proxyIpRegex.test(param)) {
         let resolvedIps = await txtdnsResult(param);
         if (!resolvedIps || resolvedIps.length === 0) return null;
@@ -1871,35 +1383,25 @@ const connectProxyIp = async (param, limit, txt) => {
             }
             resolvedIps = resolvedIps.slice(0, limit);
         }
-        let settled = false, winner = null;
-        const sockets = new Array(resolvedIps.length);
-        const closeSocket = socket => {try {socket?.close()} catch {}};
-        const connectionPromises = resolvedIps.map((ip, i) => {
+        const closeSocket = s => {try {s?.close?.()} catch {}};
+        const connectionPromises = resolvedIps.map(ip => {
             const [host, port] = parseHostPort(ip, 443);
             const socket = connect({hostname: host, port});
-            sockets[i] = socket;
-            return createConnect(host, port, undefined, socket).then(openedSocket => {
-                if (settled && openedSocket !== winner) closeSocket(openedSocket);
-                return openedSocket;
+            return socket.opened.then(() => socket, err => {
+                closeSocket(socket);
+                throw err;
             });
         });
-        return await Promise.any(connectionPromises).then(socket => {
-            settled = true, winner = socket;
-            for (const other of sockets) if (other !== socket) closeSocket(other);
-            return socket;
-        }, err => {
-            settled = true;
-            for (const socket of sockets) closeSocket(socket);
-            throw err;
-        });
+        return raceAny(connectionPromises, closeSocket).catch(() => null);
     }
     const [host, port] = parseHostPort(param, 443);
-    return concurrentConnect(host, port, limit);
+    return concurrentConnect(host, port, limit, undefined, addrTypeIs(host));
 };
 const strategyExecutorMap = new Map([
-    [0, async ({addrType, port, addrBytes}, _param, _limit, _txt) => {
+    [0, async ({addrType, port, addrBytes, isHttp}, _param, limit, _txt) => {
         const hostname = binaryAddrToString(addrType, addrBytes);
-        return concurrentConnect(hostname, port);
+        if (isHttp) addrType = addrTypeIs(hostname);
+        return concurrentConnect(hostname, port, limit, undefined, addrType);
     }],
     [1, async ({addrType, port, addrBytes}, param, limit, _txt) => {
         return connectViaSocksProxy(addrType, port, param, addrBytes, limit);
@@ -1928,26 +1430,9 @@ const strategyExecutorMap = new Map([
     }]
 ]);
 const concurrentStrategyExec = (parsedRequest, params, exec, limit, txt) => {
-    let settled = false, winner = null;
-    const sockets = new Set(), closeSocket = socket => {try {socket?.close?.()} catch {}};
-    const attempts = params.map(param => Promise.resolve().then(() => exec(parsedRequest, param, limit, txt)).then(socket => {
-        if (!socket) throw 0;
-        if (settled && socket !== winner) {
-            closeSocket(socket);
-            throw 0;
-        }
-        sockets.add(socket);
-        return socket;
-    }));
-    return Promise.any(attempts).then(socket => {
-        settled = true, winner = socket;
-        for (const other of sockets) if (other !== socket) closeSocket(other);
-        return socket;
-    }, err => {
-        settled = true;
-        for (const socket of sockets) closeSocket(socket);
-        throw err;
-    });
+    const closeResource = s => {try {s?.close?.()} catch {}};
+    const attempts = params.map(param => Promise.resolve().then(() => exec(parsedRequest, param, limit, txt)));
+    return raceAny(attempts, closeResource);
 };
 const getUrlParam = (offset, len) => {
     if (len <= 0) return null;
@@ -1968,7 +1453,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
         list = cachedResult.list, speed = cachedResult.speed;
     } else {
         if (clean.length < 6 || clean.length > 1024) {
-            list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+            list.push({type: 0}, {type: 3}, {type: 3, param: finallyProxyHost});
         } else {
             const urlBytes = textEncoder.encode(clean);
             wasmMem.set(urlBytes, dataPtr);
@@ -2001,7 +1486,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
                 !list.length && list.push({type: 0});
             } else {
                 add(ipVal, 3), add(txtipVal, 3, true);
-                list.push({type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+                list.push({type: 3}, {type: 3, param: finallyProxyHost});
             }
         }
         const oldKey = urlListCacheKeys[urlListCacheIndex];
@@ -2201,10 +1686,6 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         const tcpResult = await establishTcpConnection(parsedRequest, request);
         if (!tcpResult) return close();
         state.tcpSocket = tcpResult.socket;
-        if (state.xhttpPipeTo) {
-            state.xhttpPayload = payload;
-            return;
-        }
         const tcpWriter = state.tcpSocket.writable.getWriter();
         const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
         if (payload.byteLength) tcpWriter.write(payload);
@@ -2230,7 +1711,8 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
             })().catch(close);
         } else {
             state.tcpWriter = bufferedTcpWriter;
-            if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
+            if (state.tcpSocket.extra?.length) await writable.send(state.tcpSocket.extra);
+            if (state.xwebPipeTo) return;
             manualPipe(state.tcpSocket.readable, writable, close, tcpResult.speed);
         }
     }
@@ -2258,81 +1740,51 @@ const handleWebSocketConn = async (webSocket, request) => {
     if (earlyData) processingQueue(earlyData);
     webSocket.addEventListener("message", event => (state.tcpWriter || processingQueue)(event.data));
     webSocket.addEventListener("error", close);
-    webSocket.addEventListener("close", close);
 };
-const xhttpHeaders = {'Content-Type': 'application/octet-stream', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
-const pipeToWithPrefix = (readable, writable, prefix, options) => {
-    if (prefix?.byteLength) {
-        const writer = writable.getWriter();
-        writer.write(prefix);
-        writer.releaseLock();
-    }
-    return readable.pipeTo(writable, options);
-};
-const handleXhttpPost = async (request) => {
+const xwebHeaders = {'Content-Type': 'application/octet-stream', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
+const handleXwebPost = async (request) => {
     const reader = request.body?.getReader({mode: 'byob'});
     if (!reader) return new Response(null, {status: 400});
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xhttpPipeTo: true};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xwebPipeTo: true};
     const bridge = new IdentityTransformStream(), responseWriter = bridge.writable.getWriter();
-    let xhttpBuffer = new ArrayBuffer(8192), used = 0, uploadAbort = null, writerReleased = false;
+    let xwebBuffer = new ArrayBuffer(8192), used = 0;
     const close = () => {
-        uploadAbort?.abort();
         try {state.tcpSocket?.close()} catch {}
-        if (!writerReleased) {
-            writerReleased = true;
-            responseWriter.abort().catch(() => {});
-            responseWriter.releaseLock();
-        }
+        if (state.xwebPipeTo) responseWriter.close().catch(() => {});
     };
-    const writable = {
-        send: (chunk) => {
-            if (!chunk?.byteLength || writerReleased) return;
-            return responseWriter.write(chunk);
-        }
-    };
+    const writable = {send(chunk) {if (chunk?.byteLength) return responseWriter.write(chunk)}};
     (async () => {
         while (true) {
             if (used > 0) {
-                const payload = new Uint8Array(xhttpBuffer, 0, used);
-                state.tcpWriter ? await state.tcpWriter(payload) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
-                if (state.tcpSocket) {
-                    reader.releaseLock();
-                    uploadAbort = new AbortController();
-                    if (!writerReleased) {
-                        writerReleased = true;
-                        responseWriter.releaseLock();
-                    }
-                    const downPrefix = state.tcpSocket.extra?.byteLength ? state.tcpSocket.extra : null;
-                    pipeToWithPrefix(request.body, state.tcpSocket.writable, state.xhttpPayload, {signal: uploadAbort.signal}).catch(close);
-                    pipeToWithPrefix(state.tcpSocket.readable, bridge.writable, downPrefix).catch(close);
-                    return;
+                const payload = new Uint8Array(xwebBuffer, 0, used);
+                state.tcpWriter ? await state.tcpWriter(payload.slice()) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
+                if (state.tcpSocket && state.xwebPipeTo) {
+                    state.xwebPipeTo = false;
+                    responseWriter.releaseLock();
+                    state.tcpSocket.readable.pipeTo(bridge.writable).catch(close);
                 }
                 if (!state.needMore) {
                     used = 0;
                     continue;
                 }
             }
-            const {done, value} = await reader.read(new Uint8Array(xhttpBuffer, used, used === 0 ? 8192 : 4096));
+            const {done, value} = await reader.read(new Uint8Array(xwebBuffer, used, used === 0 ? 8192 : 4096));
             if (done) return close();
-            xhttpBuffer = value.buffer;
+            xwebBuffer = value.buffer;
             used += value.byteLength;
         }
     })().catch(close);
-    return new Response(bridge.readable, {headers: xhttpHeaders});
-};
-const getErrorResponse = async (status = 200) => {
-    if (!rawErrorHtml) rawErrorHtml = await decompressWasm(getErrorHtmlPtr, getErrorHtmlLen);
-    return new Response(rawErrorHtml, {status, headers: {'Content-Type': 'text/html; charset=UTF-8'}});
+    return new Response(bridge.readable, {headers: xwebHeaders});
 };
 const getSub = async (request, url, uuid) => {
-    if (uuid && url.searchParams.get('uuid') !== uuid) return await getErrorResponse(404);
+    if (uuid && url.searchParams.get('uuid') !== uuid) return fetch(errorHtmlUrl);
     const ua = (request.headers.get('User-Agent') || '').toLowerCase();
     const proxyPath = url.searchParams.get('path') || '';
     const host = url.hostname;
     const hasVL = url.searchParams.get('vl') === '1';
     const hasTR = url.searchParams.get('tj') === '1';
     const hasWS = url.searchParams.get('ws') === '1';
-    const hasXhttp = url.searchParams.get('xhttp') === '1';
+    const hasXweb = url.searchParams.get('xweb') === '1';
     const hasECH = url.searchParams.get('ech') === '1';
     const hasWsNoTLS = url.searchParams.get('wstls') === '0' || url.searchParams.get('wsnotls') === '1';
     const encPath = encodeURIComponent(proxyPath);
@@ -2349,9 +1801,9 @@ const getSub = async (request, url, uuid) => {
     };
     const addNodes = (base, allowWsNoTLS) => {
         const wsNoTLS = allowWsNoTLS && hasWsNoTLS;
-        const xhttpBase = base + (allowWsNoTLS ? 3 : 2);
+        const xwebBase = base + (allowWsNoTLS ? 3 : 2);
         if (hasWS) processTemplate(base + (wsNoTLS ? 2 : hasECH ? 1 : 0), wsNoTLS ? 80 : 443);
-        if (hasXhttp) processTemplate(xhttpBase + (hasECH ? 1 : 0));
+        if (hasXweb) processTemplate(xwebBase + (hasECH ? 1 : 0));
     };
     if (hasVL) addNodes(0, true);
     if (hasTR) addNodes(5, false);
@@ -2366,7 +1818,7 @@ const getSub = async (request, url, uuid) => {
                     : (url.searchParams.has(strList[9]) || ua.includes(strList[9])) ? strList[9]
                         : (url.searchParams.has(strList[10]) || ua.includes(strList[10])) ? strList[10] : '';
     if (target) {
-        const baseUrl = `${url.protocol}//${url.host}${url.pathname}?uuid=${globalThis.subUuid}&format=raw&path=${encPath}&vl=${hasVL ? 1 : 0}&tj=${hasTR ? 1 : 0}&ws=${hasWS ? 1 : 0}&wstls=${hasWsNoTLS ? 0 : 1}&xhttp=${hasXhttp ? 1 : 0}&ech=${hasECH ? 1 : 0}`;
+        const baseUrl = `${url.protocol}//${url.host}${url.pathname}?uuid=${globalThis.subUuid}&format=raw&path=${encPath}&vl=${hasVL ? 1 : 0}&tj=${hasTR ? 1 : 0}&ws=${hasWS ? 1 : 0}&wstls=${hasWsNoTLS ? 0 : 1}&xweb=${hasXweb ? 1 : 0}&ech=${hasECH ? 1 : 0}`;
         const convertUrl = `${strList[0]}/sub?target=${target}&url=${encodeURIComponent(baseUrl)}&insert=false&config=${encodeURIComponent(strList[1])}&emoji=true&scv=true`;
         try {
             const response = await fetch(convertUrl, {
@@ -2389,7 +1841,7 @@ const getSub = async (request, url, uuid) => {
 export default {
     async fetch(request, env) {
         if (!isInitialized) initializeWasm(env);
-        if (request.method === 'POST' && request.headers.get('content-type') === 'application/grpc-web') return handleXhttpPost(request);
+        if (request.method === 'POST' && request.headers.get('content-type') === 'application/grpc-web') return handleXwebPost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
             webSocket.accept({allowHalfOpen: true}), webSocket.binaryType = "arraybuffer";
@@ -2400,13 +1852,13 @@ export default {
         const {uuid, password, user, pass, sspass} = getEnv(env);
         if (url.pathname === '/sub') return await getSub(request, url, uuid);
         if (url.pathname === `/${uuid}` || url.pathname === `/${password}`) {
-            if (!rawHtml) {
-                rawHtml = await decompressWasm(getPanelHtmlPtr, getPanelHtmlLen);
-                const map = {UUID: uuid, PASS: password, HTTPPASS: `${user}:${pass}`, SSPASS: sspass, IPLIST: JSON.stringify(ipListAll), ECHDNS: encodeURIComponent(sharedEchDns)};
-                rawHtml = rawHtml.replace(/{{(UUID|PASS|HTTPPASS|SSPASS|IPLIST|ECHDNS)}}/g, (_, k) => map[k]);
-            }
-            return new Response(rawHtml, {headers: {'Content-Type': 'text/html; charset=UTF-8'}});
+            const panelResponse = await fetch(panelHtmlUrl);
+            if (!panelResponse.ok) throw new Error(`Failed to fetch panel html: ${panelResponse.status}`);
+            let html = await panelResponse.text();
+            const map = {UUID: uuid, PASS: password, HTTPPASS: `${user}:${pass}`, SSPASS: sspass, IPLIST: JSON.stringify(ipListAll), ECHDNS: encodeURIComponent(sharedEchDns)};
+            html = html.replace(/{{(UUID|PASS|HTTPPASS|SSPASS|IPLIST|ECHDNS)}}/g, (_, k) => map[k]);
+            return new Response(html, {headers: {'Content-Type': 'text/html; charset=UTF-8'}});
         }
-        return await getErrorResponse();
+        return fetch(errorHtmlUrl);
     }
 };
